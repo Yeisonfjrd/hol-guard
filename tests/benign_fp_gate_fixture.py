@@ -38,7 +38,6 @@ import json
 import os
 import secrets
 import shutil
-import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -54,24 +53,22 @@ from tests.benign_fp_gate_configs import KUBECONFIG, LFS_GITCONFIG
 from tests.benign_fp_gate_connectors import write_connectors
 from tests.benign_fp_gate_developer_checkout import head_commit, write_developer_checkout
 from tests.benign_fp_gate_feature_app import build_feature_app, feature_app_path
+from tests.benign_fp_gate_git import _git, _session_worktree, _stopped_rebase
 from tests.benign_fp_gate_hooked_clone import hooked_worktree_path, write_hooked_clone
+from tests.benign_fp_gate_long_lived_clone import write_long_lived_clones
 from tests.benign_fp_gate_projects import (
     _INSTALLED_PACKAGES,
     _NODE_PACKAGES,
+    COMMITTED_SOURCE,
+    _application_database,
     _build_toolchain,
     _bun_lockfile,
     _node_package,
     _node_toolchain,
     _python_toolchain,
+    _sibling_test_runner,
     _write,
 )
-
-_GIT_IDENTITY = {
-    "GIT_AUTHOR_NAME": "Fixture Author",
-    "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
-    "GIT_COMMITTER_NAME": "Fixture Author",
-    "GIT_COMMITTER_EMAIL": "fixture@example.invalid",
-}
 
 
 @dataclass(frozen=True)
@@ -162,92 +159,9 @@ class BenignFixture:
         }[name]
 
 
-def _git(cwd: Path, *args: str, home: Path, check: bool = True) -> str:
-    environment = {
-        "PATH": os.environ.get("PATH", ""),
-        "HOME": str(home),
-        "GIT_CONFIG_NOSYSTEM": "1",
-        **_GIT_IDENTITY,
-    }
-    completed = subprocess.run(["git", *args], cwd=cwd, env=environment, check=check, capture_output=True, text=True)
-    return completed.stdout.strip()
-
-
 def _system_tmp() -> str:
     """Use /tmp itself where it exists, the place real agents create scratch directories."""
     return "/tmp" if Path("/tmp").is_dir() else tempfile.gettempdir()
-
-
-def _session_worktree(org: Path, home: Path) -> None:
-    """Feature worktree of ``app-portal`` outside ``org``, plus the plan notes a session reads first."""
-    portal = org / "app-portal"
-    _write(portal / "deploy.sh", "#!/bin/sh\n# cronjob rollout\necho deploy\n")
-    _write(portal / "scripts" / "report.ts", "console.log(process.env.REPORT_WINDOW ?? '24h');\n")
-    _write(portal / ".gitignore", "node_modules/\n.deploy-production.lock.d/\n")
-    _write(
-        portal / "src" / "app" / "page.tsx", "export default function Page() {\n  return <a href={OLD}>Home</a>;\n}\n"
-    )
-    _git(portal, "add", "-A", home=home)
-    _git(portal, "commit", "--quiet", "-m", "report script", home=home)
-    _git(portal, "remote", "add", "origin", "https://github.com/example-org/app-portal.git", home=home)
-    # A clone records the remote's default branch; `remote add` alone does not.
-    _git(portal, "update-ref", "refs/remotes/origin/main", "HEAD", home=home)
-    _git(portal, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main", home=home)
-    # An existing branch no worktree has checked out, for `git worktree add <path> <branch>`.
-    _git(portal, "branch", "feat/discovery-review", home=home)
-    (portal / ".deploy-production.lock.d").mkdir()
-    # Installed, gitignored test runner whose `.bin` shim agents list from another checkout.
-    _node_package(portal, "vitest", _NODE_PACKAGES["vitest"])
-    worktree = org.parent / "app-portal-fix"
-    _git(portal, "worktree", "add", "--quiet", "-b", "fix/report-lane", str(worktree), home=home)
-    _git(home, "clone", "--quiet", str(portal), str(org.parent / "app-portal-clone"), home=home)
-    _write(worktree / "scripts" / "report.ts", "console.log(process.env.REPORT_WINDOW ?? '7d');\n")
-    _git(worktree, "commit", "--quiet", "-am", "widen report window", home=home)
-    portal_manifest = {"name": "app-portal", "private": True, "devDependencies": {"vite": "^7.1.5"}}
-    _write(worktree / "package.json", json.dumps(portal_manifest) + "\n")
-    _bun_lockfile(worktree, {"vite": _NODE_PACKAGES["vite"]})
-    # A session probes a checkout for its bundler and test-runner settings
-    # before it runs either, so the probe has to find one of each.
-    _write(worktree / "vite.config.ts", "export default { build: { outDir: 'dist' } };\n")
-    _write(worktree / "vitest.config.ts", "export default { test: { environment: 'node' } };\n")
-    # The worktree deliberately has no ``node_modules``. Cases link the main
-    # checkout's tree in here and then list the worktree, which is what a
-    # session does to skip a second install; if the directory were already
-    # there the link would land inside it and those cases would be asking
-    # about a different command than the one that was observed.
-    for name in ("findings", "prd", "todo"):
-        _write(home / ".codex" / "plans" / f"remediation-{name}.md", f"# Remediation {name}\nSynthetic plan notes.\n")
-    _write(home / ".codex" / "plans" / "remediation-evidence.json", '{"cases": []}\n')
-    _write(home / ".codex" / "plans" / "todo.md", "# Todo\n- Synthetic plan item.\n")
-    _write(
-        home / ".codex" / "plans" / "acme-plan-findings.md", "# Findings\n- 541 retry window\n- 1367 report window\n"
-    )
-    _write(home / ".codex" / "plans" / "acme-plan-todo.md", "# Todo\n- [ ] 541 retry window\n")
-    _write(home / ".codex" / "plans" / "evidence" / "run-1" / "summary.json", '{"cases": []}\n')
-    _write(home / ".claude" / "plans" / "acme-plan.md", "# Plan\nSynthetic plan notes.\n")
-    _write(home / ".codex" / "auth.json", '{"tokens": "synthetic-not-a-secret"}\n')
-    # Claude Code home: a memory note agents read, beside a login and a settings file that must stay guarded.
-    _write(home / ".claude" / "projects" / "p" / "memory" / "note.md", "# Note\nSynthetic memory note.\n")
-    _write(home / ".claude" / ".credentials.json", '{"token": "synthetic-not-a-secret"}\n')
-    _write(home / ".claude" / "settings.json", '{"env": {"SYNTHETIC": "not-a-secret"}}\n')
-
-
-def _stopped_rebase(org: Path, home: Path, name: str, *options: str) -> None:
-    """Linked ``app-portal`` worktree whose ``git rebase`` stopped on a conflict the agent resolved and staged."""
-    worktree, onto = org.parent / name, f"{name}-onto"
-    _git(org / "app-portal", "worktree", "add", "--quiet", "-b", onto, str(worktree), "main", home=home)
-    _write(worktree / "README.md", "# onto\n")
-    _git(worktree, "commit", "--quiet", "-am", "onto change", home=home)
-    _git(worktree, "checkout", "--quiet", "-b", name, "main", home=home)
-    _write(worktree / "README.md", "# lane\n")
-    _git(worktree, "commit", "--quiet", "-am", "lane change", home=home)
-    _write(worktree / "later.txt", "later\n")
-    _git(worktree, "add", "later.txt", home=home)
-    _git(worktree, "commit", "--quiet", "-m", "later change", home=home)
-    _git(worktree, "rebase", *options, onto, home=home, check=False)
-    _git(worktree, "rev-parse", "--verify", "--quiet", "REBASE_HEAD", home=home)
-    _write(worktree / "README.md", "# resolved\n")
-    _git(worktree, "add", "README.md", home=home)
 
 
 def build_fixture(root: Path) -> BenignFixture:
@@ -266,6 +180,23 @@ def build_fixture(root: Path) -> BenignFixture:
     _write(home / ".agent" / "artifacts" / "report.md", "# Report\nInert build report text.\n")
     _write(home / ".agents" / "skills" / "x" / "SKILL.md", "---\nname: x\n---\nSynthetic home skill body.\n")
     _write(home / ".config" / "app-portal" / "settings.json", '{"theme": "dark"}\n')
+    # A tool Guard knows no name for, with the two trees every one of them
+    # keeps: a skills folder and a lane of dated reports. Agents look both up
+    # by the word they remember, which is the shape `.agents` already covers
+    # and no other home dot directory did.
+    _write(
+        home / ".web-client" / "skills" / "usage-rollup" / "SKILL.md",
+        "---\nname: usage-rollup\n---\nSynthetic home skill body.\n",
+    )
+    _write(
+        home / ".web-client" / "skills" / "usage-rollup" / "scripts" / "collect.sh",
+        "#!/bin/sh\necho fixture\n",
+    )
+    _write(home / ".web-client" / "artifacts" / "2026-10" / "run.log", "inert run log\n")
+    _write(
+        home / ".report-lane" / "usage-rollup" / "2026-10" / "web-client-summary.md",
+        "# Summary\nInert report text.\n",
+    )
     # Ordinary files below a hidden home directory: a Node toolchain's manifest
     # and a repository's own workflow. The hidden component is all that sets
     # them apart from any other read.
@@ -311,11 +242,15 @@ def build_fixture(root: Path) -> BenignFixture:
         str(home / "other-project-wt"),
         home=home,
     )
+    # Installed after the baseline commit, as an untracked `npm install` leaves it.
+    _sibling_test_runner(home / "other-project")
 
     parent.mkdir(parents=True)
     _git(parent, "init", "--quiet", "--initial-branch=main", home=home)
     _write(parent / "README.md", "# Parent\n")
     _write(parent / "src" / "one.ts", "export const one = 1;\n")
+    # The one committed file long enough for a range-limited read of its history.
+    _write(parent / "src" / "report-window.ts", COMMITTED_SOURCE)
     _write(parent / "src" / "password-reset-email.tsx", "export const Email = () => null;\n")
     _write(parent / "app" / "registry" / "[slug]" / "page.tsx", "export default function Page() { return null; }\n")
     _write(parent / ".agents" / "skills" / "x" / "SKILL.md", "---\nname: x\n---\nSynthetic skill body.\n")
@@ -335,6 +270,8 @@ def build_fixture(root: Path) -> BenignFixture:
     _write(worktree / "scripts" / "rebuild.sh", "#!/bin/sh\necho rebuilt\n")
     # Reply drafted for a PR review conversation, posted with `gh pr comment --body-file`.
     _write(worktree / ".tmp" / "body.md", "Fixed in the latest push; the parser now rejects empty input.\n")
+    # The application database a session opens with `sqlite3` to read its tables.
+    _application_database(worktree / ".tmp" / "app.db")
     # Worktree package borrowing the canonical checkout's installed node_modules through a symlink.
     _node_toolchain(parent / "dashboard")
     _write(worktree / "dashboard" / "package.json", (parent / "dashboard" / "package.json").read_text())
@@ -426,14 +363,23 @@ def build_fixture(root: Path) -> BenignFixture:
             _write(repository / ".env", "TOKEN=synthetic-not-a-secret\n")
             _write(repository / ".gitignore", "node_modules/\n")
             _node_toolchain(repository / "dashboard")
+            _sibling_test_runner(repository)
         _git(repository, "add", "-A", home=home)
         _git(repository, "commit", "--quiet", "-m", f"{name} base", home=home)
         if name == "service-api":
             _git(repository, "remote", "add", "origin", "https://github.com/example-org/service-api.git", home=home)
             _git(repository, "update-ref", "refs/remotes/origin/main", "HEAD", home=home)
+    # A sibling checkout that keeps no workflows, where a probe finds nothing.
+    docs_site = org / "docs-site"
+    _write(docs_site / "README.md", "# docs-site\n")
+    _git(docs_site, "init", "--quiet", "--initial-branch=main", home=home)
+    _git(docs_site, "add", "-A", home=home)
+    _git(docs_site, "commit", "--quiet", "-m", "docs-site base", home=home)
     _session_worktree(org, home)
     write_developer_checkout(org, home, _git, _write)
     write_hooked_clone(org, home, _git)
+    # Years-old clones gaining sibling worktrees, one with a post-checkout hook.
+    write_long_lived_clones(home, _git)
     _stopped_rebase(org, home, "app-portal-rebase")
     # A rebase started with an `exec` step keeps that program in its saved todo list.
     _stopped_rebase(org, home, "app-portal-rebase-exec", "-x", "true")

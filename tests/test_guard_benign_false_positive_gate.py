@@ -70,7 +70,10 @@ _FIXED_TOOLS = {
 _ALLOWED_PR = {"unassigned"}
 # The session-* cases replay prompts users approved by hand. Those still
 # reviewed on Linux CI are recorded here until their fixes land.
-_PENDING_CEILING = 3
+# Every entry is the same class: Cursor is the one harness with no containment
+# route, so work the other four run quietly inside the workspace sandbox reaches
+# a Cursor user as a review card. One route fixes all of them at once.
+_PENDING_CEILING = 4
 _RENDERED_KEYS = ("reason", "notice", "message", "systemMessage", "stopReason")
 _RENDERED_SPECIFIC_KEYS = ("permissionDecisionReason", "additionalContext")
 # Pending entries are recorded against the Linux CI host. Git helper context and
@@ -417,6 +420,37 @@ def test_one_connector_groups_its_setup_reviews_by_action(gate_environment: tupl
     assert len(groups) == 1, f"one connector must queue under one identity, got {len(groups)}"
     assert len(next(iter(groups.values()))) == len(commands), "distinct actions must keep distinct action digests"
     assert len(rows) == len(commands) * 2, "every harness call keeps its own evidence row"
+
+
+def test_an_environment_dump_is_reviewed_rather_than_refused(
+    gate_environment: tuple[BenignFixture, HookWorker],
+) -> None:
+    """Reading every exported variable asks, and the ask is one the user can answer.
+
+    A whole-environment dump is the cheapest read of every token a session
+    exports, so ``neg-printenv-all`` and ``neg-env-all`` keep it off the silent
+    path. That is a review, not a refusal: ``env``, ``env -0`` and
+    ``env | grep '^PATH='`` were read as interpreters launching a file nobody
+    opened and came back as a hard block with no approval row at all, so no
+    user could allow their own shell to print its own environment.
+    """
+    fixture, worker = gate_environment
+    for index, command in enumerate(("env", "env -0", "env | grep '^PATH='", "printenv")):
+        case = GateCase(
+            case_id=f"env-dump-{index}@claude-code",
+            base_id=f"env-dump-{index}",
+            fix_area="shell",
+            harness="claude-code",
+            tool="shell",
+            tool_input={"command": command},
+            cwd="worktree",
+            expect="not_allow",
+        )
+        result, approvals = _review(case, fixture, worker)
+        description = _describe(case, result, approvals)
+        assert _decision(result) != "allow", f"environment dump was allowed: {description}"
+        assert approvals == 1, f"environment dump left no approval to give: {description}"
+        assert not always_gap(_ROWS[case.case_id]), f"environment dump offers no Always allow: {description}"
 
 
 @pytest.mark.parametrize("case", mcp_cases(_DOCUMENT), ids=lambda case: case.case_id)

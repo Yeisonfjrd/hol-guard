@@ -34,6 +34,7 @@ pub struct PathContext<'a> {
 
 mod contained_wrapper;
 pub(crate) mod curl_reads;
+pub use curl_reads::bound_curl_read_destinations;
 pub(crate) mod dd_reads;
 mod digest_reads;
 pub(crate) mod docker_reads;
@@ -135,6 +136,7 @@ pub(crate) mod safe_reads;
 mod safe_scalar;
 mod safe_writes;
 mod script_content;
+pub(crate) use script_content::{argv_script, ArgvScript};
 mod search;
 mod search_pattern_clearance;
 mod search_scope;

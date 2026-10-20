@@ -109,6 +109,11 @@ def test_only_the_marked_cases_may_pass_on_containment() -> None:
         # for the widened search, so a contained run sends nothing and prints no key.
         "neg-git-push-to-tmp-chain",
         "neg-rg-replace-widens-home-search",
+        # A sibling checkout's workflows and test runner: a contained run reads only the
+        # workspace, so `-exec cat`, a preloaded module or a dotfile probe reaches no secret.
+        "neg-sibling-find-github-exec-cat",
+        "neg-sibling-ls-missing-env-below-github",
+        "neg-sibling-node-heap-require-other-checkout",
     }
 
 

@@ -161,10 +161,21 @@ mod tests {
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     const CHILD_MARKER_ENV: &str = "HOL_GUARD_TEST_LIVENESS_CHILD_MARKER";
+    const CHILD_PARENT_ENV: &str = "HOL_GUARD_TEST_LIVENESS_CHILD_PARENT";
     const EOF_MARKER_ENV: &str = "HOL_GUARD_TEST_LIVENESS_EOF_MARKER";
     const EOF_STARTED_ENV: &str = "HOL_GUARD_TEST_LIVENESS_EOF_STARTED";
     const ORPHAN_EOF_MARKER_ENV: &str = "HOL_GUARD_TEST_ORPHAN_EOF_MARKER";
     const ORPHAN_PARENT_ENV: &str = "HOL_GUARD_TEST_ORPHAN_PARENT";
+    // The supervisor claims its state scope before the spawn, and a scope is
+    // named by a full runtime digest.
+    const RUNTIME_DIGEST: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+    /// The scope is created below an owner-only state base, as a provisioned
+    /// Guard home has one.
+    fn private_state_base(directory: &Path) -> std::path::PathBuf {
+        crate::resident_state::ensure_private_directory(&directory.join("state"), true)
+            .expect("create private state base")
+    }
 
     #[test]
     fn liveness_pipe_remains_open_while_child_runs_and_closes_after_wait() {
@@ -181,6 +192,7 @@ mod tests {
         let eof_marker = directory.join("pipe-closed");
         let eof_started = directory.join("eof-probe-started");
         env::set_var(CHILD_MARKER_ENV, &child_marker);
+        env::set_var(CHILD_PARENT_ENV, std::process::id().to_string());
         env::set_var(EOF_MARKER_ENV, &eof_marker);
         env::set_var(EOF_STARTED_ENV, &eof_started);
 
@@ -191,24 +203,28 @@ mod tests {
         ];
         // The test process stays alive, so only the supervisor's wait closes the pipe.
         let owner = ManagedOwner {
-            state_base: &directory.join("state"),
-            digest: "0",
+            state_base: &private_state_base(&directory),
+            digest: RUNTIME_DIGEST,
             process_id: std::process::id(),
         };
         let result = supervise_managed_child(&executable, &arguments, &[0x5a; 32], &owner);
 
         env::remove_var(CHILD_MARKER_ENV);
+        env::remove_var(CHILD_PARENT_ENV);
         env::remove_var(EOF_MARKER_ENV);
         env::remove_var(EOF_STARTED_ENV);
 
-        assert!(result.is_ok(), "supervisor child should exit successfully");
+        assert!(
+            result.is_ok(),
+            "supervisor child should exit successfully: {result:?}"
+        );
         assert!(child_marker.exists(), "child did not observe an open pipe");
         wait_for_marker(&eof_marker);
         assert!(eof_started.exists(), "EOF probe did not start");
         let _ = fs::remove_file(child_marker);
         let _ = fs::remove_file(eof_marker);
         let _ = fs::remove_file(eof_started);
-        let _ = fs::remove_dir(directory);
+        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
@@ -244,8 +260,8 @@ mod tests {
         // The owner has exited and the state base holds no client leases, so the
         // child must see EOF while it is still running, not after the idle timeout.
         let owner = ManagedOwner {
-            state_base: &directory.join("missing-state"),
-            digest: "0",
+            state_base: &private_state_base(&directory),
+            digest: RUNTIME_DIGEST,
             process_id: owner_process_id,
         };
         let started = Instant::now();
@@ -253,11 +269,14 @@ mod tests {
         env::remove_var(ORPHAN_EOF_MARKER_ENV);
         env::remove_var(ORPHAN_PARENT_ENV);
 
-        assert!(result.is_ok(), "orphaned child did not see its pipe close");
+        assert!(
+            result.is_ok(),
+            "orphaned child did not see its pipe close: {result:?}"
+        );
         assert!(eof_marker.exists(), "orphaned child did not record EOF");
         assert!(started.elapsed() < Duration::from_secs(10));
         let _ = fs::remove_file(eof_marker);
-        let _ = fs::remove_dir(directory);
+        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
@@ -287,7 +306,11 @@ mod tests {
 
     #[test]
     fn liveness_pipe_child_probe() {
-        let Some(child_marker) = env::var_os(CHILD_MARKER_ENV) else {
+        // As in `orphan_child_probe`, only the spawned child acts on the
+        // process-wide variables the parent sets.
+        let spawned =
+            env::var(CHILD_PARENT_ENV).is_ok_and(|parent| parent != std::process::id().to_string());
+        let Some(child_marker) = env::var_os(CHILD_MARKER_ENV).filter(|_| spawned) else {
             return;
         };
         let eof_marker = env::var_os(EOF_MARKER_ENV).expect("EOF marker is configured");
@@ -314,7 +337,11 @@ mod tests {
 
     #[test]
     fn liveness_pipe_eof_probe() {
-        let Some(eof_started) = env::var_os(EOF_STARTED_ENV) else {
+        // The grandchild inherits the parent's PID in `CHILD_PARENT_ENV` and
+        // runs with its own, so the parent never reads its harness's stdin.
+        let spawned =
+            env::var(CHILD_PARENT_ENV).is_ok_and(|parent| parent != std::process::id().to_string());
+        let Some(eof_started) = env::var_os(EOF_STARTED_ENV).filter(|_| spawned) else {
             return;
         };
         let eof_marker = env::var_os(EOF_MARKER_ENV).expect("EOF marker is configured");

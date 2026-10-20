@@ -32,6 +32,15 @@ exception. They carry `retry_cannot_reuse_approval` and no exact-action
 binding, so the card cannot offer Allow once for them. Let the agent retry the
 command: the fresh request is queued under this rule and offers both choices.
 
+`require-reapproval` means "ask again when the artifact changes", not "ask again
+every time". A saved allow bound to the request's context token answers that
+exact artifact whatever scope carried it (artifact, workspace, publisher or
+harness), so the identical retry runs. A token whose hash differs is refused,
+and that refusal is the fresh approval the policy asks for. For a package
+request the workspace scope is the repository identity plus the dependency
+graph, so a workspace allow also answers the identical install in a linked
+worktree of the same repository.
+
 Only terminal verdicts are excluded. `block`, `sandbox-required` and `allow`
 are not reviews, so there is nothing to approve.
 
@@ -65,6 +74,7 @@ Changing any of these produces a new command, and Guard asks again.
 | Token for every review, with command-hash fallback | `rust/crates/guard-runtime/src/native_exact_action_op/token.rs` (`approval_token`, `command_hash`) |
 | Resident exact-action answer | `rust/crates/guard-runtime/src/native_exact_action_op.rs` (`decide`, `Fallback::CommandHash`) |
 | Allow once retry binding, with no package exclusion | `rust/crates/guard-runtime/src/native_exact_action_op/binding.rs` and the `Reuse::Argv` fallback in `native_exact_action_op.rs` |
+| Saved package allows reused under `require-reapproval`, any scope | `rust/crates/guard-runtime/src/package_policy_resolve_approvals.rs` (`is_durable_exact_artifact_approval`) |
 | Saved allows on the direct hook path | `rust/crates/guard-runtime/src/hook_direct_saved_decision.rs` (`approvable`) |
 | Approval scopes offered to the user | `rust/crates/guard-runtime/src/approval_scope_contract.rs` (`allow_is_non_overridable` excludes only non-review verdicts) |
 | Saved allows on the Python daemon path | `src/codex_plugin_scanner/guard/daemon/hook_native_saved_approval.py` (`_native_review_is_approvable`) |
@@ -75,6 +85,8 @@ Changing any of these produces a new command, and Guard asks again.
 - `rust/crates/guard-runtime/src/native_exact_action_op/approval_fallback_tests.rs`
 - `rust/crates/guard-runtime/src/native_exact_action_op_tests.rs` (`a_windows_launch_falls_back_to_the_command_hash`)
 - `rust/crates/guard-runtime/tests/fixtures/hook_direct_saved_decision_vectors.json` (`allow-guard-control`, `allow-package`)
+- `rust/crates/guard-runtime/src/package_policy_resolve_op_tests.rs` (`a_saved_allow_of_any_scope_lets_the_identical_require_reapproval_retry_run`, `a_changed_artifact_is_reviewed_again_whatever_scope_saved_the_allow`)
+- `tests/test_guard_package_workspace_approval.py` (`test_workspace_package_approval_is_reused_across_linked_worktrees_with_the_same_dependency_graph`)
 - `tests/test_native_review_exact_action_always.py`
 - `tests/test_native_exact_action_read_only_identity.py`
 - `tests/test_native_exact_action_benign_offers.py`

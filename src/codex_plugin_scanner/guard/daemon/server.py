@@ -34,6 +34,7 @@ from ..approval_gate import (
 )
 from ..approval_gate import input_from_mapping as approval_gate_input_from_mapping
 from ..browser_opener import open_browser_url
+from ..catalog_delivery import lifecycle
 from ..codex_live_decision import complete_codex_live_decision, resolve_codex_live_allow_authority
 from ..codex_live_decision_revalidation import revalidate_codex_live_allow
 from ..config import (
@@ -76,13 +77,14 @@ from ..native_directory_trust import (
 )
 from ..native_guard_store import NativeGuardStoreUnavailable
 from ..native_hook_evidence_writer import NativeHookEvidenceWriter, unreachable_writer_stats
+from ..native_policy_snapshot_constants import NativePolicySnapshotError
 from ..native_resident_revival import native_route_unavailable_body
 from ..native_resident_watchdog import start_native_resident_watchdog
 from ..native_runtime_request_scope import scoped_hook_post
 from ..package_firewall_action_rate_limit import PackageFirewallActionRateLimiter
 from ..runtime.approval_attention import ApprovalAttentionCoordinator
 from ..runtime.cloud_review_sync import CloudReviewSyncWorker, start_cloud_sync_sync_worker, stop_cloud_sync_sync_worker
-from ..runtime.command_extensions import BUILT_IN_COMMAND_EXTENSION_REGISTRY
+from ..runtime.command_extensions import BUILT_IN_COMMAND_EXTENSION_REGISTRY, CommandSafetyExtensionRegistry
 from ..runtime.extension_control_authority import ExtensionControlAuthorityView
 from ..runtime.extension_control_runtime import (
     ExtensionControlRuntime,
@@ -217,6 +219,10 @@ _DEFAULT_HEADLESS_CLOUD_SYNC_INTERVAL_SECONDS = 30.0
 _DEFAULT_HEADLESS_CLOUD_SYNC_BACKOFF_SECONDS = 10.0
 
 
+class _InstalledAuthorityMigrationError(Exception):
+    """The installed release's command-pack authority is not migrated yet."""
+
+
 class _HookPathValidationError(ValueError):
     def __init__(self, parameter: str, reason: str) -> None:
         self.parameter = parameter
@@ -346,6 +352,11 @@ _PEER_DISCONNECT_ERRORS = (BrokenPipeError, ConnectionResetError, ConnectionAbor
 
 class _GuardDaemonHTTPServer(BoundedThreadingHTTPServer):
     request_queue_size = _MAX_CONCURRENT_DAEMON_CONNECTIONS
+    # Set while the installed release's authority still awaits migration.
+    _installed_authority_pending: bool = False
+    # Set while the control API serves the core registry because startup could
+    # not read the installed authority.
+    _extension_control_on_core_registry: bool = False
     store: GuardStore
     runtime: GuardSurfaceRuntime
     auth_token: str
@@ -589,10 +600,27 @@ class _GuardDaemonHTTPServer(BoundedThreadingHTTPServer):
                 capture_writer=self.codex_binding_capture_writer,
             )
             bind_hook_counter_sink(self.hook_worker, getattr(self, "diagnostics", None))
-            self.extension_control_runtime = ExtensionControlRuntime(self._startup_extension_control_view())
+            from ..catalog_delivery.projection import capture
+
+            try:
+                self._migrate_installed_authority()
+                _, control_registry, _ = capture(self.store)
+                startup_view = self._startup_extension_control_view(control_registry)
+            except (_InstalledAuthorityMigrationError, NativePolicySnapshotError):
+                # An activation record this build cannot authenticate, such as
+                # one written under a newer schema, or an installed release whose
+                # authority could not be migrated, activates nothing. Start on
+                # the core registry with a tampered authority so every hook
+                # fails closed, rather than taking hook protection down with
+                # the daemon. The refresh loop keeps this snapshot until the
+                # record reads again.
+                control_registry = BUILT_IN_COMMAND_EXTENSION_REGISTRY
+                startup_view = self.store._tampered_view(control_registry.catalog_digest)
+                self._extension_control_on_core_registry = True
+            self.extension_control_runtime = ExtensionControlRuntime(startup_view)
             self.extension_control_api = ExtensionControlApiService(
                 store=self.store,
-                registry=BUILT_IN_COMMAND_EXTENSION_REGISTRY,
+                registry=control_registry,
                 runtime=self.extension_control_runtime,
             )
             self.local_cli_api = LocalCliApiService(store=self.store)
@@ -629,7 +657,25 @@ class _GuardDaemonHTTPServer(BoundedThreadingHTTPServer):
                 self.codex_binding_capture_writer.stop_capture()
             raise
 
-    def _startup_extension_control_view(self) -> ExtensionControlAuthorityView:
+    def _migrate_installed_authority(self) -> None:
+        """Admit the installed release, or report why it cannot be admitted yet.
+
+        A failure leaves the migration pending. The daemon then starts on a
+        tampered authority, so every hook fails closed instead of the daemon
+        exiting, and each refresh retries it before reading anything newer.
+        """
+
+        try:
+            self.store.migrate_installed_command_pack_authority()
+        except Exception as error:
+            self._installed_authority_pending = True
+            _LOGGER.warning("Installed command-pack authority could not be migrated: %s", error, exc_info=True)
+            raise _InstalledAuthorityMigrationError from error
+        self._installed_authority_pending = False
+
+    def _startup_extension_control_view(
+        self, registry: CommandSafetyExtensionRegistry
+    ) -> ExtensionControlAuthorityView:
         """Read the authority for startup without letting a busy lease stop the daemon.
 
         A lease timeout reports that the authority was not read, never that it
@@ -654,42 +700,57 @@ class _GuardDaemonHTTPServer(BoundedThreadingHTTPServer):
         deadline = time.monotonic() + AUTHORITY_LOCK_TIMEOUT_SECONDS
         with suppress(NativeCommandControlAuthorityUnavailableError):
             return self.store.read_extension_control_authority_for_registry(
-                BUILT_IN_COMMAND_EXTENSION_REGISTRY, lock_timeout_seconds=AUTHORITY_LOCK_TIMEOUT_SECONDS / 2
+                registry, lock_timeout_seconds=AUTHORITY_LOCK_TIMEOUT_SECONDS / 2
             )
         remaining = deadline - time.monotonic()
         if remaining > 0.0:
             with suppress(NativeCommandControlAuthorityUnavailableError, NativeCommandControlMutationRequiredError):
                 return self.store.read_extension_control_authority_for_registry(
-                    BUILT_IN_COMMAND_EXTENSION_REGISTRY, read_only=True, lock_timeout_seconds=remaining
+                    registry, read_only=True, lock_timeout_seconds=remaining
                 )
-        return self.store.extension_control_authority_unreadable_view(
-            BUILT_IN_COMMAND_EXTENSION_REGISTRY.catalog_digest
-        )
+        return self.store.extension_control_authority_unreadable_view(registry.catalog_digest)
 
     def refresh_extension_control_runtime(self) -> ExtensionControlRuntimeSnapshot:
+        from ..catalog_delivery.projection import capture, require_current
         from ..native_command_control_authority_io import (
             NativeCommandControlAuthorityUnavailableError,
             NativeCommandControlMutationRequiredError,
+            hold_command_control_authority_lock,
         )
+        from ..native_command_control_authority_store import _key
 
+        def read(*, shared: bool) -> ExtensionControlRuntimeSnapshot:
+            _, registry, activation_digest = capture(self.store)
+            with hold_command_control_authority_lock(self.store.guard_home, shared=shared):
+                require_current(self.store, _key(self.store), activation_digest)
+                view = self.store.read_extension_control_authority_for_registry(registry, read_only=shared)
+                snapshot = self.extension_control_runtime.refresh(view)
+            if self._extension_control_on_core_registry:
+                # Startup bound the control API to the core registry. Once the
+                # authority reads again, serve the registry it was read for so
+                # previews and mutations stop failing against the core one.
+                self.extension_control_api.rebind_registry(registry)
+                self._extension_control_on_core_registry = False
+            return snapshot
+
+        if self._installed_authority_pending:
+            try:
+                self._migrate_installed_authority()
+            except _InstalledAuthorityMigrationError:
+                # Nothing newer is admitted until the release is migrated.
+                return self.extension_control_runtime.current()
         try:
-            view = self.store.read_extension_control_authority_for_registry(
-                BUILT_IN_COMMAND_EXTENSION_REGISTRY, read_only=True
-            )
+            try:
+                return read(shared=True)
+            except NativeCommandControlMutationRequiredError:
+                # Release the shared lease before migration and recapture the
+                # active projection under the exclusive mutation fence.
+                return read(shared=False)
         except NativeCommandControlAuthorityUnavailableError:
             # Nothing was read, so there is nothing to refresh from. Keeping the
             # snapshot already installed beats replacing a known authority with
             # the absence of a reading.
             return self.extension_control_runtime.current()
-        except NativeCommandControlMutationRequiredError:
-            # Release the shared read before a migration takes an exclusive
-            # lease and re-verifies authority. Routine refreshes must coexist
-            # with the native decision's shared mutation fence.
-            try:
-                view = self.store.read_extension_control_authority_for_registry(BUILT_IN_COMMAND_EXTENSION_REGISTRY)
-            except NativeCommandControlAuthorityUnavailableError:
-                return self.extension_control_runtime.current()
-        return self.extension_control_runtime.refresh(view)
 
     def process_request(self, request: Any, client_address: Any) -> None:
         request_socket = cast(socket.socket, request)
@@ -3836,6 +3897,11 @@ class GuardDaemonServer:
             except Exception:
                 contained = False
         contained = self._join_service_background_threads() and contained
+        extension_control_api = getattr(self._server, "extension_control_api", None)
+        if extension_control_api is not None:
+            # Best effort: process exit releases the leases anyway.
+            with suppress(Exception):
+                _ = extension_control_api.release_prepared_cache_leases()
         with suppress(Exception):
             clear_guard_daemon_state_if_current(
                 self._server.store.guard_home,
@@ -4109,11 +4175,34 @@ class GuardDaemonServer:
         self._extension_control_refresh_thread.start()
 
     def _refresh_extension_control_loop(self) -> None:
+        next_security_refresh = 0.0
         while not self._shutdown_started.wait(self._extension_control_refresh_interval_seconds):
+            periodic = time.monotonic() >= next_security_refresh
             try:
-                _ = self._server.refresh_extension_control_runtime()
+                with lifecycle.session():
+                    if periodic:
+                        from ..catalog_delivery.active_security import observe
+                        from ..catalog_delivery.discovery import request_refresh
+
+                        next_security_refresh = time.monotonic() + 300.0
+                        # Security observation must not wait for complete discovery
+                        # traversal. The latter has its own bounded background slot.
+                        try:
+                            observe(self._server.store)
+                        finally:
+                            request_refresh(self._server.store.guard_home, store=self._server.store)
+                    _ = self._server.refresh_extension_control_runtime()
             except Exception:
                 _LOGGER.exception("Failed to refresh resident extension-control authority")
+            if periodic:
+                try:
+                    from ..catalog_delivery.cache_io import cleanup
+
+                    with lifecycle.session():
+                        self._server.extension_control_api.expire_prepared_cache_leases()
+                        cleanup(self._server.store)
+                except Exception:
+                    _LOGGER.exception("Failed to clean the command-pack cache")
 
     def _start_aibom_inventory_refresh(self) -> None:
         if self._aibom_refresh_interval_seconds is None or self._aibom_refresh_interval_seconds <= 0:

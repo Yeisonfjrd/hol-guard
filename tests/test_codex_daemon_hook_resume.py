@@ -17,6 +17,7 @@ from codex_plugin_scanner.guard.live_process_identity import (
     CODEX_BROWSER_WAIT_TIMEOUT_SECONDS_KEY,
 )
 from codex_plugin_scanner.guard.store import GuardStore
+from tests.package_review_settings import review_package_signals
 from tests.test_guard_phase04_harness_ux import _json_line, _run_hook
 
 pytestmark = pytest.mark.usefixtures("approval_questionnaire_mode")
@@ -243,6 +244,7 @@ def test_pending_pretool_parses_request_binding_from_reason() -> None:
 
 @pytest.mark.usefixtures("native_hook_force")
 def test_codex_json_pretool_package_install_reason_includes_request(tmp_path: Path) -> None:
+    review_package_signals(tmp_path / "guard-home")
     exit_code, output = _run_hook(
         tmp_path,
         harness="codex",

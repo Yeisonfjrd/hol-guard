@@ -5,7 +5,7 @@ pub(super) use allowances::{
     project_skill_listing_directory, skill_link_resolves_over_home,
 };
 #[path = "read_feature_directories.rs"]
-mod feature_directories;
+pub(super) mod feature_directories;
 #[path = "read_path_harness_notes.rs"]
 pub(super) mod harness_notes;
 #[path = "hidden_listing.rs"]
@@ -302,6 +302,7 @@ fn path_gate(
                     || git_config_document(canonical, cwd)
                     || worktree_gitfile(canonical)
                     || scratch::workspace_scratch_read(canonical, home_dir, cwd)
+                    || scratch::private_temporary_scratch_read(canonical, home_dir)
                     || virtualenv_activation_script(canonical)))
             || (read_only && execution_output_log(canonical, home_dir)))
     {

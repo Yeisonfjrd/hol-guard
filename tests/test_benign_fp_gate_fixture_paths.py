@@ -51,6 +51,11 @@ _PROBES_FOR_ABSENCE = frozenset(
         "observed-ls-lockfile-probe-mixed",
         "queue-grep-head-wc-absent-tmp-trace",
         "session-grep-roots-one-missing-tmp-sibling",
+        # A sibling checkout that keeps no workflows, probed for them.
+        "sibling-ls-missing-github-workflows",
+        "sibling-find-missing-github-workflows",
+        "gauntlet-sibling-ls-missing-github-workflows",
+        "gauntlet-sibling-find-missing-github-workflows",
     }
 )
 
